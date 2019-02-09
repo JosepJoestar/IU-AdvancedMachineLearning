@@ -17,10 +17,15 @@ if __name__ == '__main__':
     parser.add_argument('graph_path', nargs=1)
     parser.add_argument('dataset_path', nargs=1)
     parser.add_argument('--v', action='store_true')
+    parser.add_argument('--vv', action='store_true')
     args = parser.parse_args()
     
-    if args.v:
+    if args.vv:
+        print('Super Verbose Mode enabled')
+        logging.getLogger().setLevel(logging.DEBUG)
+    elif args.v:
         print('Verbose Mode enabled')
         logging.getLogger().setLevel(logging.INFO)
+        
 
     main(args.graph_path[0], args.dataset_path[0])

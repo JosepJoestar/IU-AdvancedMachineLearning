@@ -1,98 +1,101 @@
 import logging
-import functools
 import numpy as np
 import tensorflow as tf
 
-from sklearn.model_selection import train_test_split
+# from sklearn.model_selection import train_test_split
 
 from dataloader import DataLoader, inceptioncache
 
 
-def lazyprop(function):
-    @property
-    @functools.wraps(function)
-    def decorator(self):
-        attribute = '_cache_' + function.__name__    
-        if not hasattr(self, attribute):
-            setattr(self, attribute, function(self))
-        return getattr(self, attribute)    
-    return decorator
-
-
 class FacialRecognition:
     def __init__(self, dataset_path):
-        
         # Load dataset
         self.img_paths = DataLoader.get_images_in_path(dataset_path)
+        self.img_paths_flat = DataLoader.get_flattened_paths(self.img_paths)
+        
+        # Pretrained InceptionV3
+        self.inception_input = tf.get_default_graph().get_tensor_by_name('Model_Input:0')
+        self.inception_output = tf.get_default_graph().get_tensor_by_name('Model_Output:0')
         
         # Initialize graph
-        self.graph
-        
-        # Annealing Learning Rate
-        # lr_annealing = self.lr_scheduler
-
+        self.build_graph()
 
     def train(self, epochs=500):     
-        logging.info('Start training...')
+        logging.info('Training start...')
         
-        X_train, X_valid = train_test_split(self.img_paths, test_size=0.2)
+        # Annealing Learning Rate
+        lr_annealing = self.lr_scheduler()
+    
+        # Split dataset into training and test
+        # X_train_flat, X_valid_flat = train_test_split(self.img_paths_flat, test_size=0.2)
+        X_train = self.img_paths
         
+        # Start session and initialize variables
         sess = tf.Session()
-
-        init = tf.global_variables_initializer()
-        sess.run(init)
+        sess.run(tf.global_variables_initializer())
         
         for epoch in range(epochs):
-            for batch in self.minibatches(X_train, batch_size=10, shuffle=False):
-                anchor_tensor, positive_tensor, negative_tensor = batch
-                d = {
-                        self.input_anchor: anchor_tensor,
-                        self.input_positive: positive_tensor,
-                        self.input_negative: negative_tensor,
-                        self.lr: 0.0001
-                    }
+            lr = next(lr_annealing)
+            
+            epoch_loss = 0
+            epoch_accuracy = 0
+            
+            for batch_idx, (anc_tensor, pos_tensor, neg_tensor) in enumerate(self.minibatches(X_train)):
+                d = { self.input_anchor: anc_tensor,
+                      self.input_positive: pos_tensor,
+                      self.input_negative: neg_tensor,
+                      self.lr: lr }
+                
                 loss, _ = sess.run([self.loss, self.optimizer], feed_dict=d)
-            msg = 'Epoch {}, test acc {:.4f}, test batch loss {:.4f}'
-            print(msg.format(epoch, 0, loss))
+                
+                msg = 'Minibatch {} processed with loss = {} and accuracy {}'
+                logging.debug(msg.format(batch_idx, loss, -1))
+                
+                epoch_loss += loss
+                # epoch_accuracy += acc
+                
+            # Epoch accuracy and loss by mean of each batch
+            epoch_loss /= (batch_idx + 1)
+            epoch_accuracy /= (batch_idx + 1)
+            
+            # self.saver.save(sess, 'FacialRecognitionModel', global_step=0)
+            msg = 'Epoch {:>3}, test acc {:.4f}, test batch loss {:.4f}'
+            print(msg.format(epoch, -1, epoch_loss))
 
+        # Close session after training is finished
         sess.close()
-
+        
+        logging.info('Training finished!')
 
     def test(test_data, test_target):
         pass
 
-
-    @lazyprop
-    def graph(self):
+    def build_graph(self):
         '''Build and return TensorFlow Computational Graph'''
+        logging.info('Building TF-CG...')
+        
         ### Constants
         alpha = tf.constant(0.2, dtype=tf.float32, name='Alpha')
         T = tf.constant(-0.8, dtype=tf.float32, name='Threshold')   
         
         ### Placeholders
         self.lr = tf.placeholder(dtype=tf.float32, name='LearningRate')
-        
-        # Inputs for siamese architecture
-        self.input_anchor = tf.placeholder(tf.float32, shape=(None, 2048))
-        self.input_positive = tf.placeholder(tf.float32, shape=(None, 2048))
-        self.input_negative = tf.placeholder(tf.float32, shape=(None, 2048))
+        self.input_anchor = tf.placeholder(tf.float32, shape=(None, 2048), name='Anchors')
+        self.input_positive = tf.placeholder(tf.float32, shape=(None, 2048), name='Positives')
+        self.input_negative = tf.placeholder(tf.float32, shape=(None, 2048), name='Negatives')
         
         ## New Layers
-        
         def network(inp_placeholder):        
-            dense_1 = tf.layers.dense(inp_placeholder, units=512, activation='sigmoid')            
-            dense_2 = tf.layers.dense(dense_1, units=256, activation='sigmoid')
-            dense_2_l2_norm = tf.math.l2_normalize(dense_2)
-            return tf.layers.dense(dense_2_l2_norm, units=128, activation='tanh')
+            dense_1 = tf.layers.dense(inp_placeholder, units=512, activation='sigmoid', name='Dense1')            
+            dense_2 = tf.layers.dense(dense_1, units=256, activation='sigmoid', name='Dense2')
+            dense_2_l2_norm = tf.math.l2_normalize(dense_2, name='Dense2_L2')
+            return tf.layers.dense(dense_2_l2_norm, units=128, activation='tanh', name='Dense3')
         
         ### Siamese architecture for anchor-positives-negatives
-        with tf.variable_scope('siamese', reuse=tf.AUTO_REUSE):
+        with tf.variable_scope('face_feature_extraction', reuse=tf.AUTO_REUSE):
             out_anchor = network(self.input_anchor)
             out_negative = network(self.input_positive)
             out_positive = network(self.input_negative)
-        
-        # similarity = tf.math.l2_normalize(tf.subtract(fc, fx))
-        # R = tf.subtract(0, similarity)
         
         positive_term = tf.subtract(out_anchor, out_positive)
         positive_term_norm = tf.math.l2_normalize(positive_term)
@@ -106,14 +109,32 @@ class FacialRecognition:
         
         self.optimizer = tf.train.AdamOptimizer(learning_rate=self.lr).minimize(self.loss)
         
+        # Similarity function
+        # def similarity(a, b):
+        #     dif = tf.subtract(a, b)
+        #     l2_dif = tf.math.l2_normalize(dif)
+        #     return tf.subtract(0.0, l2_dif)
+        
+        # sim_pos = similarity(out_anchor, out_positive)
+        # corr_pos = tf.math.greater(sim_pos, T)
+        # corr_pos_count = tf.reduce_sum(tf.cast(corr_pos, tf.float32))
+        
+        # sim_neg = similarity(out_anchor, out_negative)
+        # corr_neg = tf.math.less_equal(sim_neg, T)
+        # corr_neg_count = tf.reduce_sum(tf.cast(corr_neg, tf.float32))
+        
+        # corrects = tf.add(corr_pos_count, corr_neg_count)
+        # self.accuracy = tf.divide(corrects, 256.0 * 2)
+        
         # Generate visualization for tensorboard
         # > tensorboard --logdir ./tf_summary/
-        # with tf.Session() as sess:
-            # saver = tf.train.Saver()
-            # writer = tf.summary.FileWriter("./tf_summary", graph=sess.graph)
-            # writer.close()
+        with tf.Session() as sess:
+            self.saver = tf.train.Saver()
+            writer = tf.summary.FileWriter("./tf_summary", graph=sess.graph)
+            writer.close()
+            
+        logging.info('CG builded...')
     
-
     def minibatches(self, paths, batch_size=256, shuffle=True):
         '''
         Geretator to produce minibatches.
@@ -123,6 +144,8 @@ class FacialRecognition:
         :param shuffle: Shuffle the data the first time we invoke the generator.
         :yields: Pair of triplets (anch, pos, neg) for images and labels respectively.
         '''
+        logging.debug('Generating minibatches of size {}...'.format(batch_size))
+        
         if shuffle:
             np.random.shuffle(paths)
         
@@ -152,11 +175,12 @@ class FacialRecognition:
                 # positive_label = paths[i]['label']
                 # negative_label = paths[negative_idx]['label']
                 
-                if current_batch_size == batch_size:
-                    anchor_tensor = FacialRecognition.get_inception_output(anchor_paths)
-                    positive_tensor = FacialRecognition.get_inception_output(positive_paths)
-                    negative_tensor = FacialRecognition.get_inception_output(negative_paths)
+                if current_batch_size == batch_size:                    
+                    anchor_tensor = self.get_inception_output(anchor_paths)
+                    positive_tensor = self.get_inception_output(positive_paths)
+                    negative_tensor = self.get_inception_output(negative_paths)
                     
+                    logging.debug('Minibatch generated!')
                     yield anchor_tensor, positive_tensor, negative_tensor
                     
                     current_batch_size = 0
@@ -165,24 +189,23 @@ class FacialRecognition:
                     negative_paths = []
         
         if current_batch_size > 0:
+            anchor_tensor = self.get_inception_output(anchor_paths)
+            positive_tensor = self.get_inception_output(positive_paths)
+            negative_tensor = self.get_inception_output(negative_paths)
+            
+            logging.debug('Last Minibatch generated!')
             yield anchor_tensor, positive_tensor, negative_tensor
     
-    
-    @staticmethod
     @inceptioncache
-    def get_inception_output(paths):
-        inception_input = tf.get_default_graph().get_tensor_by_name('Model_Input:0')
-        inception_output = tf.get_default_graph().get_tensor_by_name('Model_Output:0')
+    def get_inception_output(self, paths):
+        imgs = DataLoader.images_to_np(paths)
         
-        img = DataLoader.images_to_np(paths)
         with tf.Session() as sess:
-            d = { inception_input: np.reshape(img, (-1, 299, 299, 3)) }
-            img_repr = sess.run(inception_output, feed_dict=d)
+            d = { self.inception_input: imgs }
+            img_repr = sess.run(self.inception_output, feed_dict=d)
 
         return img_repr
 
-
-    @lazyprop
     def lr_scheduler(self, lr=0.0001, multiplier=0.999):
         '''
         Generator of a Learning Rate Scheduler.
