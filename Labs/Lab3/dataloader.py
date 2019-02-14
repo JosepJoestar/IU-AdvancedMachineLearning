@@ -21,7 +21,7 @@ def load_inception_graph(pretrained_graph_path):
         return 'Model_Input:0', 'Model_Output:0'
     
 
-def inceptioncache(f):
+def iv3_cache(f):
     '''Decorator fot catching data output after InceptionV3 network'''
     def wrapper(*args, **kwargs):
         cache = InceptionCache()
@@ -99,12 +99,12 @@ class DataLoader:
     '''Helper class to load image data into Numpy format'''
         
     @staticmethod
-    def get_images_in_path(path, filter=True):
+    def get_images_in_path(path, filt=True):
         '''
         Iterates over the dataset folder building a list with all the images.
         
         :param path: System path from where images will be loaded.
-        :param filter: Set True to filter solitary images (training purposes).
+        :param filt: Set True to filter solitary images (training purposes).
         :returns: List[ Dict{ label: str, paths: List[str] } ].
         '''
         if not os.path.isdir(path):
@@ -115,7 +115,7 @@ class DataLoader:
         list_images_path = []
         for dirname, _, filenames in os.walk(path):
             # Filter folders with a single image
-            if filter and len(filenames) <= 1:
+            if filt and len(filenames) <= 1:
                 continue
             
             # Add next category label
@@ -128,6 +128,24 @@ class DataLoader:
                 list_images_path[-1]['paths'].append(file_path)
 
         return list_images_path
+    
+    @staticmethod
+    def load_test_data(path):
+        '''
+        Reads a CSV file and splits it into a triplet of lists
+        
+        :param path: System path from where test data will be loaded
+        :returns: Returns triplet of anchor images, positives and negatives
+        '''
+        with open(path) as f:
+            line_to_tup = lambda l: tuple(l.rstrip('\r\n').split(','))
+            images = list(map(line_to_tup, f.readlines()))[1:]
+
+            anchors = list(map(lambda t: 'dataset/' + t[0], images))
+            positives = list(map(lambda t: 'dataset/' + t[1], images))
+            negatives = list(map(lambda t: 'dataset/' + t[2], images))
+            
+            return anchors, positives, negatives
     
     @staticmethod
     def get_flattened_paths(struct):
