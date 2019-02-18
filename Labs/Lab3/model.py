@@ -25,7 +25,6 @@ class FacialRecognition:
         
         # Hyperparameters
         self.batch_size = 256
-        self.patience = 50
         
         # Initialize graph
         self.build_graph()
@@ -35,9 +34,6 @@ class FacialRecognition:
 
     def train(self, epochs=500):     
         logging.info('Training start...')
-        
-        best_accuracy = 0.0
-        count_worse = 0
         
         # Annealing Learning Rate
         lr_annealing = self.lr_scheduler()
@@ -69,25 +65,7 @@ class FacialRecognition:
                 # self.saver.save(sess, 'FacialRecognitionModel', global_step=0)
                 msg = 'Epoch {:>3}, test acc {:.4f}, test batch loss {:.4f}'
                 print(msg.format(epoch, epoch_accuracy, epoch_loss))
-                
-                # Early stopping
-                if epoch_accuracy < best_accuracy:
-                    count_worse += 1
-                    if count_worse == self.patience:
-                        msg = 'Early stopping at epoch {} after {} epochs without test accuracy improvement'
-                        print(msg.format(epoch, self.patience))
-                        
-                        print('Best accuracy: {}%'.format(best_accuracy * 100.0))
-                        logging.info('Training finished!')
-                        return
-                else:
-                    count_worse = 0
-                    best_accuracy = epoch_accuracy
-                    
-                    logging.info('Saving model...')
-                    self.saver.save(sess, './model.ckpt')
-                
-        print('Best accuracy: {}%'.format(best_accuracy * 100.0))
+
         logging.info('Training finished!')
 
     def build_graph(self):
@@ -132,13 +110,13 @@ class FacialRecognition:
         ### Loss and optimization
         positive_term = tf.subtract(out_anchor, out_positive)
         positive_term_squared = tf.math.square(positive_term)
-        positive_term_norm = tf.reduce_sum(positive_term_squared, axis=1)
+        positive_term_mean = tf.reduce_mean(positive_term_squared, axis=1)
         
         negative_term = tf.subtract(out_anchor, out_negative)
         negative_term_squared = tf.math.square(negative_term)
-        negative_term_norm = tf.reduce_sum(negative_term_squared, axis=1)
+        negative_term_mean = tf.reduce_mean(negative_term_squared, axis=1)
         
-        term_loss = tf.subtract(positive_term_norm, negative_term_norm)
+        term_loss = tf.subtract(positive_term_mean, negative_term_mean)
         term_loss_margin = tf.add(term_loss, alpha)
         term_loss_margin_positive = tf.maximum(0.0, term_loss_margin)
         self.loss = tf.reduce_mean(term_loss_margin_positive)
@@ -146,18 +124,25 @@ class FacialRecognition:
         self.optimizer = tf.train.AdamOptimizer(learning_rate=self.lr).minimize(self.loss)
         
         ### Evaluation over test set
-        sim_positives = tf.math.negative(positive_term_norm)
-        corr_positives = tf.math.greater(sim_positives, T)
-        corr_positives_mean = tf.reduce_mean(tf.cast(corr_positives, tf.float32))
-        
-        sim_negatives = tf.math.negative(negative_term_norm)
-        corr_negatives = tf.math.less_equal(sim_negatives, T)
-        corr_negatives_mean = tf.reduce_mean(tf.cast(corr_negatives, tf.float32))
-        
-        corr_sum = tf.add(corr_positives_mean, corr_negatives_mean)
-        self.accuracy = tf.divide(corr_sum, 2.0)
+        with tf.variable_scope('accuracy'):
+            def R(x, c):
+                diff = tf.subtract(c, x)
+                squared_diff = tf.math.square(diff)
+                mean_dif = tf.reduce_mean(squared_diff, axis=1)
+                return tf.math.negative(mean_dif)
+                
+            sim_positives = R(out_anchor, out_positive)
+            corr_positives = tf.math.greater(sim_positives, T)
+            corr_positives_mean = tf.reduce_mean(tf.cast(corr_positives, tf.float32))
             
-        logging.info('CG built...')
+            sim_negatives = R(out_anchor, out_negative)
+            corr_negatives = tf.math.less_equal(sim_negatives, T)
+            corr_negatives_mean = tf.reduce_mean(tf.cast(corr_negatives, tf.float32))
+            
+            corr_sum = tf.add(corr_positives_mean, corr_negatives_mean)
+            self.accuracy = tf.divide(corr_sum, 2.0)
+            
+        logging.info('CG builded...')
     
     def store_graph(self, folder_name='./tf_summary'):
         '''
