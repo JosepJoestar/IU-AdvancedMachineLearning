@@ -117,3 +117,6 @@ dmypy.json
 
 dataset/
 *.pkl
+
+# Project
+Project/
