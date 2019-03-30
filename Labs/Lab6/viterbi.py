@@ -1,13 +1,12 @@
 import csv
 import logging
 from collections import defaultdict
-from math import log10
+from math import log
 from operator import add
 from typing import Dict, List, Tuple
 
 import numpy as np
-
-NEG_INF = -999999999999
+from tqdm import tqdm
 
 
 class Viterbi:
@@ -17,154 +16,128 @@ class Viterbi:
     """
 
     def __init__(self, train_data_path: str, word2pos_distribution_path: str):
-        self._read_data(train_data_path, word2pos_distribution_path)
+        """
+        Reads training formatted as N lines of "Word, POS". Consecutive lines are meant to be in the same sentence.
+        A empty line in the data file indicates a new sentence. Stores the log-prior probabilities,
+        log-transition probabilities and log-emission probabilities.
+        :param train_data_path: Path for the training data.
+        :param word2pos_distribution_path: Path for the word2pos distribution data.
+        """
+        pos_prev = None
+        occurrences_counter = defaultdict(int)
+        transitions_counter = defaultdict(lambda: defaultdict(int))
 
-    def predict(self, seq: List[str]) -> Tuple[List[str], List[float]]:
+        with open(train_data_path, mode='r') as f:
+            for line in f.readlines():
+                line = line.strip()
+                if line == '':
+                    # New sentence, reset previous
+                    pos_prev = None
+                else:
+                    word, pos_cur = line.split()
+                    occurrences_counter[pos_cur] += 1
+                    if pos_prev is not None:  # Skip first word as we need a previous one
+                        transitions_counter[pos_cur][pos_prev] += 1
+                    pos_prev = pos_cur
+
+        self.C = Viterbi._estimate_prior_probabilities(occurrences_counter)
+        self.A = Viterbi._estimate_transition_probabilities(transitions_counter)
+        self.B, self.pos_tags = self._estimate_emission_probabilities(word2pos_distribution_path)
+
+    def predict(self, observations: List[str]) -> List[str]:
         """
         Predicts the POS for a given sentence.
-        :param seq: List of words that form the sentence.
+        :param observations: List of words that form the sentence.
         :return: List of POS corresponding to <seq>.
         """
-        hidden_prob, hidden_pos = [], []
-
-        # Use prior probabilities in first time step
+        pos_prediction = []
 
         # Prior probabilities for each POS
-        p_current = list(map(lambda x: self.prior_probabilities[x], self.pos_tags))
         # Emission probabilities for each POS from the first word
-        p_current = list(map(add, self.emission_probabilities[seq[0]], p_current))
+        p_current = list(map(lambda x: self.C[x], self.pos_tags))
+        p_current = list(map(add, self.B[observations[0]], p_current))
 
         # Get maximum probability POS and its probability
-        prob, pos = self._get_maximum_probability_pos(p_current)
-        hidden_prob.append(prob)
-        hidden_pos.append(pos)
-    
+        pos = self._get_maximum_probability_pos(p_current)
+        pos_prediction.append(pos)
+
         # Calculated with t-1 probabilities
-        for word in seq[1:]:
+        for word in observations[1:]:
             p_previous = p_current
             p_current = []
 
-            for i, pos_t in enumerate(self.pos_tags):
-                # TODO: Remove this if
-                if word not in self.emission_probabilities:
-                    return None, None
-
-                p_emi = self.emission_probabilities[word][i]
+            for i, pos_cur in enumerate(self.pos_tags):
                 p_current_pos = []
-
-                for j, pos_t_1 in enumerate(self.pos_tags):
-                    if pos_t_1 in self.transition_probabilities and \
-                            pos_t in self.transition_probabilities[pos_t_1]:
-                        p_trans = self.transition_probabilities[pos_t_1][pos_t]
-                    else:
-                        p_trans = NEG_INF  # We consider a big small number as log(0), for unseen events.
-                    p = p_emi + p_trans + p_previous[j]
+                for j, pos_prev in enumerate(self.pos_tags):
+                    # Previous prob. + Transition prob. + Emission prob.
+                    p = p_previous[j] + self.A[pos_cur][pos_prev] + self.B[word][i]
                     p_current_pos.append(p)
 
                 p_current.append(max(p_current_pos))
 
             # Get maximum probability POS and its probability
-            prob, pos = self._get_maximum_probability_pos(p_current)
-            hidden_prob.append(prob)
-            hidden_pos.append(pos)
+            pos = self._get_maximum_probability_pos(p_current)
+            pos_prediction.append(pos)
 
-        return hidden_pos, hidden_prob
-
-    def _read_data(self, train_path: str, dist_path: str):
-        """
-        Reads training formatted as N lines of "Word, POS".
-        Consecutive lines are meant to be in the same sentence.
-        A empty line in the data file indicates a new sentence.
-        Stores the log-prior, log-transition probabilities and log-emission probabilities.
-        :param train_path: Path for the training data.
-        :param dist_path: Path for the word2pos distribution data.
-        """
-        previous_tag = None
-        occurrences_counter = defaultdict(int)
-        transitions_counter = defaultdict(lambda: defaultdict(int))
-
-        with open(train_path, mode='r') as f:
-            for line in f.readlines():
-                line = line.strip()
-                if line == '':  # Empty line refers to new sentence
-                    previous_tag = None
-                else:
-                    word, tag = line.split()
-
-                    occurrences_counter[tag] += 1
-                    if previous_tag is not None:  # Skip first word as we need a previous one
-                        transitions_counter[tag][previous_tag] += 1
-
-                    previous_tag = tag
-
-        self.prior_probabilities = Viterbi._estimate_prior_probabilities(occurrences_counter)
-        self.transition_probabilities = Viterbi._estimate_transition_probabilities(transitions_counter)
-        self.emission_probabilities, self.pos_tags = Viterbi._estimate_emission_probabilities(dist_path)
+        return pos_prediction
 
     def _get_maximum_probability_pos(self, p):
         max_idx = np.array(p).argmax()
-        return p[max_idx], self.pos_tags[max_idx]
+        return self.pos_tags[max_idx]
 
-    @staticmethod
-    def _estimate_prior_probabilities(counter: Dict[str, int], log=True) -> Dict[str, float]:
-        """
-        Calculates and stores the estimation of the prior probabilities for the given data.
-        :param counter: Dictionary mapping each POS to its number of occurrences.
-        :param log: Apply log scale to the calculated probabilities (default: True).
-        :return: Prior probabilities as a map { word: p(word) }
-        """
-        prior_prob = {}
-
-        n = sum(counter.values())
-        for tag, occurrences in counter.items():
-            p = occurrences / n
-            prior_prob[tag] = log10(p) if log else p
-
-        logging.info(f'Estimated {len(counter)} prior probabilities')
-        return prior_prob
-
-    @staticmethod
-    def _estimate_transition_probabilities(counter: Dict[str, Dict[str, int]], log=True) -> Dict[str, Dict[str, float]]:
-        """
-        Calculates and stores the sparse estimation of the transition probabilities for the given data.
-        :param counter: Dictionary mapping each POS to the number of occurrences of same following POS.
-        :param log: Apply log scale to the calculated probabilities (default: True).
-        :return: Transition probabilities as a map { POSi_t: p(POSj_t-1) }
-        """
-        transition_prob = {}
-
-        for tag, next_tag_counter in counter.items():
-            transition_prob[tag] = {}
-
-            n = sum(next_tag_counter.values())
-            for next_tag, occurrences in next_tag_counter.items():
-                p = occurrences / n
-                transition_prob[tag][next_tag] = log10(p) if log else p
-
-        logging.info(f'Estimated sparse {len(counter)}x{len(counter)} transition probabilities')
-        return transition_prob
-
-    @staticmethod
-    def _estimate_emission_probabilities(path: str) -> Tuple[Dict[str, List[float]], List[str]]:
+    def _estimate_emission_probabilities(self, path: str) -> Tuple[Dict[str, List[float]], List[str]]:
         """
         Loads the distribution of probabilities for each the possible POS given a word and estimates the emission
         probabilities dividing it by the estimated prior probabilities.
         :param path: Path for the distribution data.
         :return: Emission probabilities as a map { word: [p(POS_0), ..., p(POS_N)] } and list of POS
         """
-        word2pos_prob = {}
         with open(path, mode='r') as file:
             reader = csv.reader(file, delimiter='\t')
-            header = next(reader)[1:]  # Skip first empty cell
+            # Skip first empty cell
+            header = next(reader)[1:]
+            B = defaultdict(lambda: [log(1 / len(header))] * len(header))
 
             for line in reader:
-                word = line[0]
-                if word not in word2pos_prob:  # Skip already inserted word distributions
-                    distribution = line[1:]
-                    word2pos_prob[word] = list(map(float, distribution))
+                word, logits = line[0], line[1:]
+                for i in range(len(header)):
+                    B[word][i] = float(logits[i]) - self.C[header[i]]
 
-        logging.info(f'Estimated sparse {len(word2pos_prob)}x{len(header)} emission probabilities')
-        return word2pos_prob, header
+        logging.info(f'Estimated sparse {len(B)}x{len(header)} emission probabilities')
+        return B, header
+
+    @staticmethod
+    def _estimate_prior_probabilities(d: Dict[str, int]) -> Dict[str, float]:
+        """
+        Calculates and stores the estimation of the prior probabilities for the given data.
+        :param d: Dictionary mapping each POS to its number of occurrences.
+        :return: Prior probabilities as a map { word: p(word) }
+        """
+        C = {}
+        n = sum(d.values())
+
+        for pos, occurrences in d.items():
+            C[pos] = log(occurrences / n)
+
+        logging.info(f'Estimated {len(d)} prior probabilities')
+        return C
+
+    @staticmethod
+    def _estimate_transition_probabilities(d: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, float]]:
+        """
+        Calculates and stores the sparse estimation of the transition probabilities for the given data.
+        :param d: Dictionary mapping each POS to the number of occurrences of same following POS.
+        :return: Transition probabilities as a map { POSi_t: p(POSj_t-1) }
+        """
+        A = defaultdict(lambda: defaultdict(lambda: -1e10))
+        for pos_cur, pos_prev_counter in d.items():
+            n = sum(pos_prev_counter.values())
+
+            for pos_prev, occurrences in pos_prev_counter.items():
+                A[pos_cur][pos_prev] = log(occurrences / n)
+
+        logging.info(f'Estimated sparse {len(d)}x{len(d)} transition probabilities')
+        return A
 
 
 def evaluate_hmm(alg: Viterbi, path: str, print_output: bool):
@@ -175,9 +148,10 @@ def evaluate_hmm(alg: Viterbi, path: str, print_output: bool):
         for line in f.readlines():
             line = line.strip()
             if line == '':  # Empty line refers to new sentence
-                sentences.append(sentence)
-                sentences_pos.append(sentence_pos)
-                sentence, sentence_pos = [], []
+                if sentence:
+                    sentences.append(sentence)
+                    sentences_pos.append(sentence_pos)
+                    sentence, sentence_pos = [], []
             else:
                 word, pos = line.split()
                 sentence.append(word)
@@ -188,14 +162,13 @@ def evaluate_hmm(alg: Viterbi, path: str, print_output: bool):
             sentences_pos.append(sentence_pos)
 
         correct_pos, total_pos = 0, 0
-
-        for idx in range(len(sentences)):
-            pos, _ = alg.predict(sentences[idx])
+        for idx in tqdm(range(len(sentences)), ncols=100):
+            pos = alg.predict(sentences[idx])
             if pos is None:
                 continue
 
             if print_output:
-                print(' '.join(sentences[idx]))
+                print(f' '.join(sentences[idx]))
                 print(' '.join(sentences_pos[idx]))
                 print(' '.join(pos))
                 print('-' * 150)

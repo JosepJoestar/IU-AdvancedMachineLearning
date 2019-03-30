@@ -12,12 +12,16 @@ PAD_EXPR = '<PAD>'
 
 class WordTagEstimator:
     """
-
+    Word Tag Estimation using CNN as described in https://arxiv.org/pdf/1511.08308.pdf
     """
 
-    def __init__(self, train_data_path: str):
-        self.sentences, self.pos, self.input_dim = WordTagEstimator._extract_data(train_data_path)
-        self.input_words, self.output_pos = self._pad_sequences_words(pad=PAD_EXPR)
+    def __init__(self, train_data_path: str, test_data_path: str):
+        self.train_X, self.train_Y, self.input_dim = WordTagEstimator._extract_data(train_data_path)
+        self.test_X, self.test_Y, _ = WordTagEstimator._extract_data(test_data_path)
+
+        self.train_X, self.train_Y = self._pad_sequences_words(pad=PAD_EXPR)
+        self.test_X, self.test_Y = self._pad_sequences_words(pad=PAD_EXPR, test=True)
+        self.pos_tags = set(self.train_Y)
 
         # All possible vocabulary letters, numbers and punctuation symbols
         self.vocabulary = list(string.ascii_letters + string.digits + string.punctuation)
@@ -33,27 +37,29 @@ class WordTagEstimator:
         # Mapping POS to index
         index = 0
         self.pos2idx: Dict[str, int] = {}
-        for pos in set(self.output_pos):
+        for pos in self.pos_tags:
             self.pos2idx[pos] = index
             index += 1
 
-    def create_graph(self, emb_dim: int, conv_win_size: int, learning_rate: float, summary_path='./tf_summary'):
+    def create_graph(self, emb_dim: int, hid_dim: int, conv_win_size: int, summary_path='./tf_summary'):
         """
         Create TensorFlow Computational Graph.
         Also stores a Summary of the generated graph in <summary_path> for Tensorboard visualization.
         :param emb_dim: Dimension of the embedded vectors.
+        :param hid_dim: Number of convolution kernels.
         :param conv_win_size: Window size for the convolution operation.
-        :param learning_rate: Learning rate for the optimizer.
         :param summary_path: Path to write the graph summary
         """
         logging.info('Building CG...')
 
         self.X = tf.placeholder(tf.int64, shape=[None, self.input_dim], name='Words')
-        self.Y = tf.placeholder(tf.int64, shape=[None], name='POS')
+        self.Y = tf.placeholder(tf.int64, shape=None, name='POS')
+        self.LR = tf.placeholder(tf.float32, name='LR')
 
         # Weight Matrices
         padding_vector = tf.zeros(shape=(1, emb_dim), dtype=tf.float32, name='ZeroPadding')
-        symbol_embedding = tf.get_variable('W', shape=(len(self.vocabulary), emb_dim), dtype=tf.float32)
+        symbol_embedding = tf.Variable(tf.random_uniform(shape=[len(self.vocabulary), emb_dim],
+                                                         minval=-0.5, maxval=0.5, name='W'))
         symbol_embedding = tf.concat([padding_vector, symbol_embedding], axis=0)
 
         # Lookups
@@ -61,11 +67,11 @@ class WordTagEstimator:
 
         # Convolution operation
         conv = tf.layers.conv2d(tf.expand_dims(embeddings, axis=2),
-                                filters=1, kernel_size=(emb_dim, conv_win_size),
+                                filters=hid_dim, kernel_size=(emb_dim, conv_win_size),
                                 activation='relu', padding='same')
 
         # Pooling over sequence dimension
-        conv_max = tf.reshape(conv, shape=(-1, self.input_dim, 1))
+        conv_max = tf.reshape(conv, shape=(-1, self.input_dim, hid_dim))
         conv_max = tf.reduce_max(conv_max, axis=1)
 
         #  Dense Layer 2 with #POS neurons (our final output)
@@ -77,7 +83,7 @@ class WordTagEstimator:
         self.loss = tf.reduce_mean(cross_entropy)
 
         # Optimizer
-        optimizer = tf.contrib.opt.LazyAdamOptimizer(learning_rate=learning_rate)
+        optimizer = tf.contrib.opt.LazyAdamOptimizer(learning_rate=self.LR)
         self.objective = optimizer.minimize(self.loss)
 
         # Accuracy
@@ -89,31 +95,55 @@ class WordTagEstimator:
 
         logging.info('CG built!')
 
-    def train(self, epochs: int, minibatch_size: int):
+    def train(self, epochs: int, minibatch_size: int, learning_rate: float, patience=2):
         """
         Trains the model displaying the progress and showing the confusion matrix for each epoch.
         :param epochs: Number of epochs to train the model.
         :param minibatch_size: Size of the minibatch for the optimizer step.
+        :param learning_rate: Learning rate for the optimizer.
+        :param patience: Epochs to wait until early stopping.
         """
         logging.info('Starting to train...')
         with tf.Session() as sess:
             sess.run(tf.global_variables_initializer())
 
+            lr_annealing = self.lr_scheduler(learning_rate)
+            best_test_accuracy = 0
+            pat = 0
+
             for epoch in range(1, epochs + 1):
                 print(f'\nEpoch {epoch}:')
-                progress = tf.keras.utils.Progbar(target=len(self.input_words),
+                progress = tf.keras.utils.Progbar(target=len(self.train_X),
                                                   stateful_metrics=['batch loss'], width=50, interval=0.5)
 
+                acc, loss = 0, 0
+                lr = next(lr_annealing)
                 for batch_idx, (features, labels) in enumerate(self._create_minibatches(minibatch_size)):
-                    d = {self.X: features, self.Y: labels}
+                    d = {self.X: features, self.Y: labels, self.LR: lr}
                     loss, _, acc = sess.run([self.loss, self.objective, self.accuracy], feed_dict=d)
 
                     progress.update(batch_idx * minibatch_size,
-                                    values=[('accuracy', acc),
-                                            ('batch loss', loss),
-                                            ('epoch loss', loss)])
+                                    values=[('accuracy', acc), ('batch loss', loss), ('epoch loss', loss)])
 
-                self._display_confusion_matrix(epochs, epoch, sess)
+                progress.update(len(self.train_X),
+                                values=[('accuracy', acc), ('batch loss', loss), ('epoch loss', loss)])
+
+                features = list(map(lambda w: list(map(lambda c: self.char2idx[c], w)), self.test_X))
+                labels = list(map(lambda p: self.pos2idx[p], self.test_Y))
+                acc = sess.run(self.accuracy, feed_dict={self.X: features, self.Y: labels})
+
+                print(f'Test accuracy: {acc}')
+                if acc > best_test_accuracy:
+                    best_test_accuracy = acc
+                    pat = 0
+                else:
+                    pat += 1
+
+                if pat == patience:
+                    print(f'Best accuracy obtained: {best_test_accuracy}')
+                    break
+
+            self._display_confusion_matrix(sess)
 
     def _create_minibatches(self, minibatch_size: int) -> Generator[Tuple[List[List[int]], List[int]], None, None]:
         """
@@ -122,69 +152,72 @@ class WordTagEstimator:
         :return: Yields padded words of size [BATCH_SIZE, max_len_word] and POS of size [BATCH_SIZE]
         """
         batch_x, batch_y = [], []
-        for idx, word in enumerate(self.input_words):
-            batch_x.append(list(map(lambda x: self.char2idx[x], word)))
-            batch_y.append(self.pos2idx[self.output_pos[idx]])
+        for idx, word in enumerate(self.train_X):
+            batch_x.append(list((map(lambda x: self.char2idx[x], word))))
+            batch_y.append(self.pos2idx[self.train_Y[idx]])
             if (idx + 1) % minibatch_size == 0:
-                yield batch_x, batch_y
+                yield batch_x, np.array(batch_y)
                 batch_x, batch_y = [], []
-        yield batch_x, batch_y
+        yield batch_x, np.array(batch_y)
 
-    def _pad_sequences_words(self, pad: str) -> Tuple[List[str], List[str]]:
+    def _pad_sequences_words(self, pad: str, test=False) -> Tuple[List[str], List[str]]:
         """
         Splits sentences into words and adds padding to make them all of length max_len_word.
         :param pad: Padding character (shouldn't be one of the vocabulary symbols.
         :return: List of words padded and another list of their corresponding POS tag.
         """
+        sentences = self.train_X if not test else self.test_X
+        pos = self.train_Y if not test else self.test_Y
+
         padded_words = []
         padded_words_pos = []
-        for i, sentence in enumerate(self.sentences):
+        for i, sentence in enumerate(sentences):
             for j, word in enumerate(sentence):
+                word = word[:self.input_dim]
                 padded_word = [pad] * self.input_dim
                 splitted_word = list(word)
                 left_pad = (self.input_dim - len(splitted_word)) // 2
                 padded_word[left_pad:left_pad + len(splitted_word)] = splitted_word
 
                 padded_words.append(padded_word)
-                padded_words_pos.append(self.pos[i][j])
+                padded_words_pos.append(pos[i][j])
 
         return padded_words, padded_words_pos
 
-    def _display_confusion_matrix(self, epochs: int, epoch: int, sess: tf.Session):
+    def _display_confusion_matrix(self, sess: tf.Session):
         """
         Displays confusion matrix of a given epoch for the POS tagging.
-        :param epochs: Total number of epochs.
-        :param epoch: Current epoch index.
+        :param sess: TensorFlow session
         """
-        # rows = (epochs // 5) + (epochs % 5 != 0)
-        # plt.subplot(rows, 5, epoch)
-
-        true_pos = list(map(lambda p: self.pos2idx[p], self.output_pos))
-        d = {self.X: list(map(lambda w: list(map(lambda c: self.char2idx[c], w)), self.input_words)),
-             self.Y: true_pos}
-
+        true_pos = list(map(lambda p: self.pos2idx[p], self.test_Y))
+        d = {self.X: list(map(lambda w: list(map(lambda c: self.char2idx[c], w)), self.test_X)), self.Y: true_pos}
         pred_pos = sess.run(self.predictions, feed_dict=d)
+
         cm = confusion_matrix(true_pos, pred_pos)
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
 
-        print(cm)
-        return None
-
-        plt.figure(num=None, figsize=(16, 12), dpi=80, facecolor='w', edgecolor='k')
-        fig, ax = plt.subplots()
+        fig, ax = plt.subplots(figsize=(20, 20), dpi=100)
+        ax.grid(False)
         im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
         ax.figure.colorbar(im, ax=ax)
-        # We want to show all ticks...
-        ax.set(xticks=np.arange(cm.shape[1]),
-               yticks=np.arange(cm.shape[0]),
-               # ... and label them with the respective list entries
-               xticklabels=set(self.output_pos), yticklabels=set(self.output_pos),
-               title='Test',
-               ylabel='True label',
-               xlabel='Predicted label')
+        ax.set(xticks=np.arange(cm.shape[1]), yticks=np.arange(cm.shape[0]),
+               xticklabels=self.pos_tags, yticklabels=self.pos_tags,
+               title='Test confusion Matrix', ylabel='True label', xlabel='Predicted label')
 
-        # Rotate the tick labels and set their alignment.
-        plt.setp(ax.get_xticklabels(), rotation=90, ha="right",
-                 rotation_mode="anchor")
+        plt.setp(ax.get_xticklabels(), rotation=90, ha='right', rotation_mode='anchor')
+        plt.savefig('cm.png')
+
+    @staticmethod
+    def lr_scheduler(lr=0.001, multiplier=0.999) -> Generator[float, None, None]:
+        """
+        Generator of a Learning Rate Scheduler.
+        :param lr: Initial Learning Rate.
+        :param multiplier: Multiplier factor applier to last iteration LR (0 < multiplier < 1).
+        :yields: Descending LR each time next element is called.
+        """
+        while True:
+            yield lr
+            lr *= multiplier
 
     @staticmethod
     def _extract_data(path: str) -> Tuple[List[List[str]], List[str], int]:
@@ -200,10 +233,11 @@ class WordTagEstimator:
             sentence, sentence_pos = [], []
             for line in f.readlines():
                 line = line.strip()
-                if line == '':  # Empty line refers to new sentence
-                    sentences.append(sentence)
-                    sentences_pos.append(sentence_pos)
-                    sentence, sentence_pos = [], []
+                if line == '':  # Empty line refers to new sentence. Reset.
+                    if sentence:
+                        sentences.append(sentence)
+                        sentences_pos.append(sentence_pos)
+                        sentence, sentence_pos = [], []
                 else:
                     word, pos = line.split()
                     sentence.append(word)
@@ -229,6 +263,6 @@ class WordTagEstimator:
 if __name__ == '__main__':
     tf.reset_default_graph()
     logging.getLogger().setLevel(logging.INFO)
-    model = WordTagEstimator('train_pos.txt')
-    model.create_graph(emb_dim=100, conv_win_size=5, learning_rate=0.001)
-    model.train(epochs=60, minibatch_size=512)
+    model = WordTagEstimator('train_pos.txt', 'test_pos.txt')
+    model.create_graph(emb_dim=100, hid_dim=53, conv_win_size=5)
+    model.train(epochs=80, minibatch_size=32, learning_rate=0.0108)

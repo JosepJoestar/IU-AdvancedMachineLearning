@@ -117,6 +117,7 @@ dmypy.json
 
 dataset/
 *.pkl
+*.gz
 
 # Project
 Project/
